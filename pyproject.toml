@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "botbox"
+dynamic = ["version"]
+description = "Run coding agents like Claude Code inside a bubblewrap sandbox with an opt-in path allowlist."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Scott Shawcroft", email = "scott@chickadee.tech" }]
+keywords = ["bubblewrap", "sandbox", "claude-code", "agent", "security"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "typer>=0.12",
+    "tomlkit>=0.13",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+botbox = "botbox:main"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { fallback_version = "0.0.0" }
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+include = ["botbox.py", "default-config.toml"]
+
+[tool.hatch.build.targets.sdist]
+include = ["botbox.py", "default-config.toml", "README.md", "pyproject.toml", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

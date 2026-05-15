@@ -1,0 +1,20 @@
+# Default botbox config. Copied to ~/.config/botbox/config.toml on first run.
+# Each agents.<name> table becomes a `botbox <name>` subcommand.
+
+default_agent = "claude"
+
+# Python venv to bind read-only and prepend to PATH inside the sandbox.
+# Uncomment and edit if you have a shared venv:
+# [python]
+# venv = "~/repos/venv"
+
+[paths]
+# Repos to expose to the sandbox. The current working directory is always
+# bound rw for the invocation, so list things here only when you want them
+# available beyond cwd (e.g. a sibling library edited alongside the main repo).
+rw = []
+ro = []
+
+[agents.claude]
+command = "claude"
+args = ["--dangerously-skip-permissions"]
