@@ -4,6 +4,16 @@ Config lives at ~/.config/botbox/config.toml. Each agents.<name> table becomes
 a subcommand (e.g. `botbox claude`) that runs the configured command with its
 default args, plus any extra args passed on the CLI.
 
+Any unknown subcommand is forwarded straight to bwrap (e.g. `botbox bash` runs
+bash inside the sandbox), so arbitrary one-off commands work without config.
+
+Pass `--trace` (before the subcommand) to wrap the invocation in
+`strace -e trace=openat,execve --status=failed`. After the command exits
+botbox shows which host paths it tried to open but couldn't reach inside
+the sandbox and offers to add them to the allowlist — regardless of whether
+the command succeeded. Set `trace = true` in the config to enable on every
+invocation.
+
 See the README at https://github.com/... or the source for a full config example.
 """
 
@@ -28,8 +38,12 @@ See the README at https://github.com/... or the source for a full config example
 # no --new-session (would break the interactive TTY).
 
 import os
+import re
 import shlex
 import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -85,14 +99,25 @@ def load_venv(doc) -> Optional[Path]:
 
 
 def load_agents(doc) -> dict[str, dict]:
+    """Parse agent tables. Defaults state_dir to a per-agent sandboxed path
+    so the sandboxed agent gets its own ~/.claude; set state_dir = "host" in
+    config to bind the host's real ~/.claude instead."""
     agents = doc.get("agents") or {}
-    return {
-        str(name): {
+    out: dict[str, dict] = {}
+    for name, cfg in agents.items():
+        raw = cfg.get("state_dir")
+        if raw is None:
+            state_dir: Optional[Path] = expand(f"~/.local/share/botbox/{name}")
+        elif str(raw) == "host":
+            state_dir = None
+        else:
+            state_dir = expand(str(raw))
+        out[str(name)] = {
             "command": str(cfg.get("command", name)),
             "args": [str(a) for a in (cfg.get("args") or [])],
+            "state_dir": state_dir,
         }
-        for name, cfg in agents.items()
-    }
+    return out
 
 
 def default_agent(doc) -> Optional[str]:
@@ -105,7 +130,22 @@ def die(msg: str) -> None:
     raise typer.Exit(1)
 
 
-def build_bwrap_cmd(agent_command: str, agent_args: list[str]) -> tuple[str, list[str]]:
+def _prepare_state_dir(state_dir: Path) -> tuple[Path, Path]:
+    """Ensure <state_dir>/.claude and <state_dir>/.claude.json exist so bwrap can bind them."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_claude = state_dir / ".claude"
+    state_json = state_dir / ".claude.json"
+    state_claude.mkdir(exist_ok=True)
+    if not state_json.exists():
+        state_json.write_text("{}\n")
+    return state_claude, state_json
+
+
+def build_bwrap_cmd(
+    agent_command: str,
+    agent_args: list[str],
+    state_dir: Optional[Path] = None,
+) -> tuple[str, list[str]]:
     home = Path.home()
     user = os.environ.get("USER", "")
     ssh_sock = os.environ.get("SSH_AUTH_SOCK", "")
@@ -157,9 +197,14 @@ def build_bwrap_cmd(agent_command: str, agent_args: list[str]) -> tuple[str, lis
     # if (home / ".npm").is_dir():
     #     cmd += ["--bind", str(home / ".npm"), str(home / ".npm")]
 
-    for p in (home / ".claude", home / ".claude.json"):
-        if p.exists():
-            cmd += ["--bind", str(p), str(p)]
+    if state_dir is not None:
+        sc, sj = _prepare_state_dir(state_dir)
+        cmd += ["--bind", str(sc), str(home / ".claude")]
+        cmd += ["--bind", str(sj), str(home / ".claude.json")]
+    else:
+        for p in (home / ".claude", home / ".claude.json"):
+            if p.exists():
+                cmd += ["--bind", str(p), str(p)]
 
     if venv:
         if not venv.exists():
@@ -167,11 +212,20 @@ def build_bwrap_cmd(agent_command: str, agent_args: list[str]) -> tuple[str, lis
         elif venv not in [e[0] for e in entries]:
             cmd += ["--ro-bind", str(venv), str(venv)]
 
+    # Mount a fresh /dev before any --dev-bind entries from the allowlist,
+    # otherwise the tmpfs overlay would mask binds we just set up.
+    cmd += ["--dev", "/dev"]
+
     for p, ro in entries:
         if not p.exists():
             typer.echo(f"warning: {p} missing; skipping", err=True)
             continue
-        cmd += ["--ro-bind" if ro else "--bind", str(p), str(p)]
+        s = str(p)
+        if s == "/dev" or s.startswith("/dev/"):
+            flag = "--dev-bind"
+        else:
+            flag = "--ro-bind" if ro else "--bind"
+        cmd += [flag, s, s]
 
     path_env = os.environ.get("PATH", "/usr/bin:/bin")
     if venv and venv.exists():
@@ -180,7 +234,6 @@ def build_bwrap_cmd(agent_command: str, agent_args: list[str]) -> tuple[str, lis
     cmd += [
         "--tmpfs", "/tmp",
         "--proc", "/proc",
-        "--dev", "/dev",
         "--setenv", "HOME", str(home),
         "--setenv", "USER", user,
         "--setenv", "PATH", path_env,
@@ -225,17 +278,19 @@ def list_cmd() -> None:
             mark = " (default)" if name == default else ""
             argstr = " " + " ".join(shlex.quote(a) for a in cfg["args"]) if cfg["args"] else ""
             typer.echo(f"  {name}{mark}: {cfg['command']}{argstr}")
+            if cfg.get("state_dir"):
+                typer.echo(f"    state_dir: {cfg['state_dir']}")
     if not venv and not entries and not agents:
         typer.echo(f"(empty; edit {CONFIG_FILE} or run: botbox add)")
 
 
 @app.command()
 def add(
-    path: Optional[Path] = typer.Argument(None, help="Path to add (default: cwd)."),
+    paths: Optional[list[Path]] = typer.Argument(None, help="Paths to add (default: cwd)."),
     ro: bool = typer.Option(False, "--ro", help="Bind read-only."),
 ) -> None:
-    """Add a path to the allowlist."""
-    p = (path or Path.cwd()).resolve()
+    """Add one or more paths to the allowlist."""
+    targets = [p.resolve() for p in paths] if paths else [Path.cwd().resolve()]
     doc = read_doc()
     if "paths" not in doc:
         doc["paths"] = tomlkit.table()
@@ -243,12 +298,234 @@ def add(
     if key not in doc["paths"]:
         doc["paths"][key] = tomlkit.array()
     arr = doc["paths"][key]
-    if p in [expand(str(x)) for x in arr]:
-        typer.echo(f"already present in paths.{key}: {p}")
-        return
-    arr.append(str(p))
+    existing = {expand(str(x)) for x in arr}
+    changed = False
+    for p in targets:
+        if p in existing:
+            typer.echo(f"already present in paths.{key}: {p}")
+            continue
+        arr.append(str(p))
+        existing.add(p)
+        changed = True
+        typer.echo(f"added paths.{key}: {p}")
+    if changed:
+        write_doc(doc)
+
+
+_OPENAT_RE = re.compile(r'openat\([^,]+,\s*"((?:[^"\\]|\\.)*)"')
+_EXECVE_RE = re.compile(r'execve\("((?:[^"\\]|\\.)*)"')
+
+_SYSTEM_PREFIXES = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/proc", "/sys", "/dev", "/tmp")
+_ETC_BOUND = (
+    "/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/ca-certificates",
+    "/etc/pki", "/etc/passwd", "/etc/group", "/etc/nsswitch.conf",
+    "/etc/localtime", "/etc/alternatives",
+)
+_PKG_ROOTS = ("/opt", "/srv", "/var/lib", "/var/local")
+
+
+def _parse_strace(trace_file: Path) -> set[Path]:
+    """Extract absolute paths from openat/execve lines in a strace -o file."""
+    paths: set[Path] = set()
+    for line in trace_file.read_text(errors="replace").splitlines():
+        for rx in (_OPENAT_RE, _EXECVE_RE):
+            m = rx.search(line)
+            if not m:
+                continue
+            raw = m.group(1).encode().decode("unicode_escape", errors="replace")
+            if raw.startswith("/"):
+                paths.add(Path(raw))
+    return paths
+
+
+def _is_default_covered(p: Path, home: Path, venv: Optional[Path], extras: list[Path]) -> bool:
+    """True if p is already mounted by build_bwrap_cmd's standard set."""
+    s = str(p)
+    for d in _SYSTEM_PREFIXES:
+        if s == d or s.startswith(d + "/"):
+            return True
+    for f in _ETC_BOUND:
+        if s == f or s.startswith(f + "/"):
+            return True
+    covered_home = (
+        home / ".claude", home / ".claude.json",
+        home / ".gitconfig", home / ".config" / "git",
+        home / ".ssh" / "known_hosts",
+        home / ".local",
+    )
+    for h in covered_home:
+        if p == h or h in p.parents:
+            return True
+    if venv and (p == venv or venv in p.parents):
+        return True
+    for e in extras:
+        if p == e or e in p.parents:
+            return True
+    return False
+
+
+def _autofix_target(p: Path) -> Path:
+    """Pick a sensible directory to allowlist for a discovered path."""
+    parts = p.parts
+    for root in _PKG_ROOTS:
+        rp = Path(root).parts
+        if len(parts) > len(rp) and parts[: len(rp)] == rp:
+            return Path(*parts[: len(rp) + 1])
+    return p if p.is_dir() else p.parent
+
+
+def _dedupe_targets(targets: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    for t in sorted(set(targets), key=lambda x: x.parts):
+        if any(o == t or o in t.parents for o in out):
+            continue
+        out.append(t)
+    return out
+
+
+def _prompt_target(p: Path) -> Optional[Path]:
+    opts: list[tuple[str, Path]] = [("file", p), ("parent dir", p.parent)]
+    pkg = _autofix_target(p)
+    if pkg not in (o[1] for o in opts):
+        opts.append(("package root", pkg))
+    typer.echo(f"\n  {p}")
+    for i, (label, t) in enumerate(opts, 1):
+        typer.echo(f"    [{i}] {label}: {t}")
+    typer.echo("    [s] skip")
+    raw = typer.prompt("    choice", default="1").strip().lower()
+    if raw == "s":
+        return None
+    try:
+        return opts[int(raw) - 1][1]
+    except (ValueError, IndexError):
+        typer.echo("    invalid; skipping")
+        return None
+
+
+def _save_allowlist(doc: tomlkit.TOMLDocument, key: str, targets: list[Path]) -> list[Path]:
+    if "paths" not in doc:
+        doc["paths"] = tomlkit.table()
+    if key not in doc["paths"]:
+        doc["paths"][key] = tomlkit.array()
+    arr = doc["paths"][key]
+    existing = {expand(str(x)) for x in arr}
+    added: list[Path] = []
+    for t in targets:
+        if t in existing:
+            continue
+        arr.append(str(t))
+        existing.add(t)
+        added.append(t)
     write_doc(doc)
-    typer.echo(f"added paths.{key}: {p}")
+    return added
+
+
+# Whether to wrap the sandboxed command in strace so we can offer to add
+# missing paths to the allowlist. None = use config / default (False).
+# Overridden by the top-level --trace / --no-trace flags consumed in main().
+_TRACE_OVERRIDE: Optional[bool] = None
+
+
+def _trace_enabled() -> bool:
+    if _TRACE_OVERRIDE is not None:
+        return _TRACE_OVERRIDE
+    val = read_doc().get("trace")
+    return False if val is None else bool(val)
+
+
+def _consume_trace_flags(args: list[str]) -> tuple[list[str], Optional[bool]]:
+    """Strip leading --trace / --no-trace tokens. Returns (rest, override)."""
+    override: Optional[bool] = None
+    while args:
+        if args[0] == "--trace":
+            override = True
+            args = args[1:]
+        elif args[0] == "--no-trace":
+            override = False
+            args = args[1:]
+        else:
+            break
+    return args, override
+
+
+def run_under_sandbox(cmd: list[str]) -> int:
+    """Run a bwrap command, wrapping in strace if --trace was passed. Always
+    offer to add any host paths the command tried to reach but couldn't."""
+    if not _trace_enabled():
+        return _run_passthrough(cmd)
+    strace = shutil.which("strace")
+    if strace is None:
+        typer.echo("warning: strace not found; running without trace", err=True)
+        return _run_passthrough(cmd)
+    with tempfile.NamedTemporaryFile(prefix="botbox-trace-", suffix=".log", delete=False) as tf:
+        trace_file = Path(tf.name)
+    try:
+        wrapped = [
+            strace, "-f", "-qq",
+            "-e", "trace=openat,execve",
+            "--status=failed",
+            "--signal=none",
+            "-o", str(trace_file),
+            "--", *cmd,
+        ]
+        rc = _run_passthrough(wrapped)
+        _offer_autofix(trace_file)
+        return rc
+    finally:
+        trace_file.unlink(missing_ok=True)
+
+
+def _run_passthrough(cmd: list[str]) -> int:
+    try:
+        return subprocess.run(cmd).returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def _offer_autofix(trace_file: Path) -> None:
+    paths = _parse_strace(trace_file)
+    doc = read_doc()
+    home = Path.home()
+    venv = load_venv(doc)
+    extras = [p for p, _ in load_paths(doc)]
+    candidates = sorted(
+        (p for p in paths
+         if not _is_default_covered(p, home, venv, extras) and p.exists()),
+        key=lambda x: x.parts,
+    )
+    if not candidates:
+        return
+
+    typer.echo(
+        f"\ntrace: {len(candidates)} host path(s) the command tried to open "
+        f"were not accessible inside the sandbox:",
+        err=True,
+    )
+    for p in candidates:
+        typer.echo(f"  {p}", err=True)
+
+    raw = typer.prompt("\n[a]dd all / [r]eview each / [n]o", default="n").strip().lower()
+    choice = raw[:1] if raw else "n"
+    if choice == "n":
+        return
+
+    if choice == "r":
+        chosen: list[Path] = []
+        for p in candidates:
+            t = _prompt_target(p)
+            if t is not None:
+                chosen.append(t)
+        targets = _dedupe_targets(chosen)
+    else:
+        targets = candidates
+
+    if not targets:
+        return
+    added = _save_allowlist(doc, "ro", targets)
+    for t in added:
+        typer.echo(f"added paths.ro: {t}")
+    if added:
+        typer.echo("re-run the command to pick up the new mounts.")
 
 
 @app.command()
@@ -281,7 +558,7 @@ def print_cmd(
     if name not in agents:
         die(f"error: unknown agent '{name}'; known: {', '.join(agents) or '(none)'}")
     cfg = agents[name]
-    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"] + list(ctx.args))
+    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"] + list(ctx.args), state_dir=cfg.get("state_dir"))
     typer.echo(" \\\n  ".join(shlex.quote(a) for a in cmd))
 
 
@@ -296,15 +573,17 @@ def _register_agents(app: typer.Typer) -> None:
         command = cfg["command"]
         default_args = cfg["args"]
 
-        def make_handler(command: str, default_args: list[str]):
+        state_dir = cfg.get("state_dir")
+
+        def make_handler(command: str, default_args: list[str], state_dir: Optional[Path]):
             def handler(ctx: typer.Context) -> None:
-                bwrap, cmd = build_bwrap_cmd(command, default_args + list(ctx.args))
-                os.execvp(bwrap, cmd)
+                _, cmd = build_bwrap_cmd(command, default_args + list(ctx.args), state_dir=state_dir)
+                raise typer.Exit(run_under_sandbox(cmd))
             args_help = " ".join(default_args) if default_args else "(none)"
             handler.__doc__ = f"Run `{command}` in the sandbox. Default args: {args_help}."
             return handler
 
-        app.command(name=name, context_settings=PASSTHROUGH)(make_handler(command, default_args))
+        app.command(name=name, context_settings=PASSTHROUGH)(make_handler(command, default_args, state_dir))
 
 
 @app.callback(invoke_without_command=True)
@@ -320,14 +599,24 @@ def _root(ctx: typer.Context) -> None:
     if name not in agents:
         die(f"error: default_agent '{name}' has no [agents.{name}] table")
     cfg = agents[name]
-    bwrap, cmd = build_bwrap_cmd(cfg["command"], cfg["args"])
-    os.execvp(bwrap, cmd)
+    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"], state_dir=cfg.get("state_dir"))
+    raise typer.Exit(run_under_sandbox(cmd))
 
 
 _register_agents(app)
 
 
 def main() -> None:
+    global _TRACE_OVERRIDE
+    args, override = _consume_trace_flags(sys.argv[1:])
+    if override is not None:
+        _TRACE_OVERRIDE = override
+    sys.argv = [sys.argv[0]] + args
+    if args and not args[0].startswith("-"):
+        click_cmd = typer.main.get_command(app)
+        if args[0] not in click_cmd.commands:
+            _, cmd = build_bwrap_cmd(args[0], args[1:])
+            sys.exit(run_under_sandbox(cmd))
     app()
 
 

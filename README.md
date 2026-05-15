@@ -49,10 +49,19 @@ ro = []
 [agents.claude]
 command = "claude"
 args = ["--dangerously-skip-permissions"]
+# state_dir = "host"   # uncomment to share the host's real ~/.claude
 ```
 
 Each `[agents.<name>]` table becomes a subcommand. `command` is the binary
 to exec; `args` is prepended to anything you pass on the CLI.
+
+`state_dir` controls where the agent's `~/.claude` and `~/.claude.json` come
+from inside the sandbox. By default (unset) it points at
+`~/.local/share/botbox/<agent>` on the host, so sandboxed runs get their
+own session/login state and don't read or modify your host Claude. Set it
+to `"host"` to bind the host's real `~/.claude` instead, or to any path
+for a custom location. The directory and a stub `.claude.json` are created
+on first run; you'll need to log in once inside the sandbox.
 
 ## Usage
 
@@ -60,17 +69,51 @@ to exec; `args` is prepended to anything you pass on the CLI.
 botbox                  # run the default agent
 botbox claude           # run a specific agent
 botbox claude --resume  # extra args are forwarded after the configured ones
+botbox bash             # any unknown name is forwarded to bwrap as-is
 botbox list             # show config
 botbox add              # add cwd to paths.rw
-botbox add --ro PATH    # add PATH read-only
+botbox add PATH...      # add one or more paths to paths.rw
+botbox add --ro PATH... # add paths read-only
 botbox venv ~/repos/v   # set the default Python venv
 botbox print claude     # print the bwrap command instead of executing it
+botbox --trace claude   # wrap in strace and prompt to allowlist missing paths
 ```
 
 The current working directory is always bound rw for the invocation,
 regardless of whether it's in the allowlist — list paths there only when
 you want them visible from somewhere else (e.g. a sibling library edited
 alongside the main repo).
+
+### Allowlisting with --trace
+
+Pass `--trace` *before* the subcommand to wrap the invocation in
+`strace -e trace=openat,execve --status=failed`:
+
+```
+botbox --trace claude
+botbox --trace bash
+```
+
+After the command exits, botbox parses the trace for paths the command
+tried to open but couldn't reach inside the sandbox, drops anything already
+covered, and prompts — regardless of whether the command succeeded:
+
+```
+trace: 5 host path(s) the command tried to open were not accessible inside the sandbox:
+  /opt/claude-code/bin/claude
+  /opt/claude-code/cli.js
+  /opt/claude-code/sdk.mjs
+  ...
+[a]dd all / [r]eview each / [n]o (n):
+```
+
+`a` adds each listed path as its own `paths.ro` entry (no rollup). `r` walks
+each file and lets you pick file / parent dir / package root (`/opt/<x>`,
+`/srv/<x>`, `/var/lib/<x>`) individually if you'd rather widen the bind.
+
+Strace adds ~no measurable overhead to interactive agents (most time is
+spent waiting on I/O), so you can set `trace = true` in the config to
+enable on every invocation; `--no-trace` then disables for a single run.
 
 ## What's inside the sandbox
 

@@ -3,6 +3,12 @@
 
 default_agent = "claude"
 
+# Wrap every sandbox invocation in strace so botbox can detect paths the
+# command tried to open but couldn't reach inside the sandbox, and offer to
+# add them to the allowlist. Default is off; enable per invocation with
+# `--trace` before the subcommand, or uncomment below to enable globally.
+# trace = true
+
 # Python venv to bind read-only and prepend to PATH inside the sandbox.
 # Uncomment and edit if you have a shared venv:
 # [python]
@@ -18,3 +24,8 @@ ro = []
 [agents.claude]
 command = "claude"
 args = ["--dangerously-skip-permissions"]
+# Sandboxed runs get their own session/login state at
+# ~/.local/share/botbox/claude by default. Set to "host" to share the host's
+# real ~/.claude, or to a custom path. The directory and a stub .claude.json
+# are created on first run; you'll need to log in once inside the sandbox.
+# state_dir = "host"
