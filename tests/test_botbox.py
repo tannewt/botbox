@@ -296,12 +296,29 @@ def test_parse_strace_extracts_openat_and_execve(tmp_path):
         '12345 openat(AT_FDCWD, "/opt/claude-code/lib/cli.js", O_RDONLY|O_CLOEXEC) = 3\n'
         '12345 openat(AT_FDCWD, "/etc/resolv.conf", O_RDONLY) = 4\n'
         '12345 openat(AT_FDCWD, "relative/path", O_RDONLY) = 5\n'
+        '12345 stat("/opt/claude-code/lib", 0x7fff...) = -1 ENOENT (No such file or directory)\n'
+        '12345 access("/usr/share/kicad", F_OK) = -1 ENOENT (No such file or directory)\n'
+        '12345 newfstatat(AT_FDCWD, "/opt/claude-code", 0x7fff..., 0) = -1 ENOENT (No such file or directory)\n'
+        '12345 lstat("/opt/claude-code/lib/cli.js", 0x7fff...) = -1 ENOENT (No such file or directory)\n'
+        '12345 faccessat(AT_FDCWD, "/home/user/.config/kicad", F_OK, 0) = -1 ENOENT (No such file or directory)\n'
+        '12345 readlink("/proc/self/exe", 0x7fff..., 4096) = -1 ENOENT (No such file or directory)\n'
+        '12345 readlinkat(AT_FDCWD, "/usr/bin/kicad-cli", 0x7fff..., 4096) = -1 ENOENT (No such file or directory)\n'
+        '12345 open("/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)\n'
     )
     paths = botbox._parse_strace(sample)
+    # original syscalls still work
     assert Path("/opt/claude-code/bin/claude") in paths
     assert Path("/opt/claude-code/lib/cli.js") in paths
     assert Path("/etc/resolv.conf") in paths
     assert not any(str(p).startswith("relative") for p in paths)
+    # new syscalls
+    assert Path("/opt/claude-code/lib") in paths
+    assert Path("/usr/share/kicad") in paths
+    assert Path("/opt/claude-code") in paths
+    assert Path("/home/user/.config/kicad") in paths
+    assert Path("/proc/self/exe") in paths
+    assert Path("/usr/bin/kicad-cli") in paths
+    assert Path("/etc/ld.so.cache") in paths
 
 
 def test_is_default_covered_system_and_etc(tmp_path):

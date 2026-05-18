@@ -8,8 +8,8 @@ Any unknown subcommand is forwarded straight to bwrap (e.g. `botbox bash` runs
 bash inside the sandbox), so arbitrary one-off commands work without config.
 
 Pass `--trace` (before the subcommand) to wrap the invocation in
-`strace -e trace=openat,execve --status=failed`. After the command exits
-botbox shows which host paths it tried to open but couldn't reach inside
+`strace -e trace=openat,open,stat,lstat,newfstatat,access,faccessat,readlink,readlinkat,execve --status=failed`.
+After the command exits botbox shows which host paths it tried to open but couldn't reach inside
 the sandbox and offers to add them to the allowlist — regardless of whether
 the command succeeded. Set `trace = true` in the config to enable on every
 invocation.
@@ -312,8 +312,14 @@ def add(
         write_doc(doc)
 
 
-_OPENAT_RE = re.compile(r'openat\([^,]+,\s*"((?:[^"\\]|\\.)*)"')
-_EXECVE_RE = re.compile(r'execve\("((?:[^"\\]|\\.)*)"')
+# Patterns for syscalls where the path is the second argument (after a fd/AT_FDCWD)
+_PATH_SECOND_RE = re.compile(
+    r'\b(?:openat|newfstatat|faccessat|readlinkat|statx)\([^,]+,\s*"((?:[^"\\]|\\.)*)"'
+)
+# Patterns for syscalls where the path is the first string argument
+_PATH_FIRST_RE = re.compile(
+    r'\b(?:stat|lstat|access|open|readlink|execve)\("((?:[^"\\]|\\.)*)"'
+)
 
 _SYSTEM_PREFIXES = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/proc", "/sys", "/dev", "/tmp")
 _ETC_BOUND = (
@@ -325,10 +331,10 @@ _PKG_ROOTS = ("/opt", "/srv", "/var/lib", "/var/local")
 
 
 def _parse_strace(trace_file: Path) -> set[Path]:
-    """Extract absolute paths from openat/execve lines in a strace -o file."""
+    """Extract absolute paths from failed file-system related strace lines."""
     paths: set[Path] = set()
     for line in trace_file.read_text(errors="replace").splitlines():
-        for rx in (_OPENAT_RE, _EXECVE_RE):
+        for rx in (_PATH_SECOND_RE, _PATH_FIRST_RE):
             m = rx.search(line)
             if not m:
                 continue
@@ -462,7 +468,7 @@ def run_under_sandbox(cmd: list[str]) -> int:
     try:
         wrapped = [
             strace, "-f", "-qq",
-            "-e", "trace=openat,execve",
+            "-e", "trace=openat,open,stat,lstat,newfstatat,access,faccessat,readlink,readlinkat,execve",
             "--status=failed",
             "--signal=none",
             "-o", str(trace_file),
