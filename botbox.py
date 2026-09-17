@@ -14,6 +14,10 @@ the sandbox and offers to add them to the allowlist — regardless of whether
 the command succeeded. Set `trace = true` in the config to enable on every
 invocation.
 
+Pass `--no-venv` (before the subcommand) to skip binding and setting PATH/VIRTUAL_ENV
+for the configured Python venv for this invocation. Useful for running commands that
+shouldn't see the venv.
+
 See the README at https://github.com/... or the source for a full config example.
 """
 
@@ -145,6 +149,7 @@ def build_bwrap_cmd(
     agent_command: str,
     agent_args: list[str],
     state_dir: Optional[Path] = None,
+    disable_venv: bool = False,
 ) -> tuple[str, list[str]]:
     home = Path.home()
     user = os.environ.get("USER", "")
@@ -169,6 +174,9 @@ def build_bwrap_cmd(
     for d in ("/usr", "/bin", "/sbin", "/lib", "/lib64"):
         if Path(d).exists():
             cmd += ["--ro-bind", d, d]
+
+    # Arch's /lib is a symlink to /usr/lib and we need a /lib32
+    cmd += ["--ro-bind", "/usr/lib32", "/lib32"]
 
     for f in ("/etc/resolv.conf", "/etc/hosts", "/etc/ssl",
               "/etc/ca-certificates", "/etc/pki",
@@ -206,7 +214,7 @@ def build_bwrap_cmd(
             if p.exists():
                 cmd += ["--bind", str(p), str(p)]
 
-    if venv:
+    if venv and not disable_venv:
         if not venv.exists():
             typer.echo(f"warning: venv {venv} missing", err=True)
         elif venv not in [e[0] for e in entries]:
@@ -228,7 +236,7 @@ def build_bwrap_cmd(
         cmd += [flag, s, s]
 
     path_env = os.environ.get("PATH", "/usr/bin:/bin")
-    if venv and venv.exists():
+    if not disable_venv and venv and venv.exists():
         path_env = f"{venv}/bin:{path_env}"
 
     cmd += [
@@ -240,7 +248,7 @@ def build_bwrap_cmd(
         "--setenv", "TERM", os.environ.get("TERM", "xterm-256color"),
         "--setenv", "LANG", os.environ.get("LANG", "C.UTF-8"),
     ]
-    if venv and venv.exists():
+    if not disable_venv and venv and venv.exists():
         cmd += ["--setenv", "VIRTUAL_ENV", str(venv)]
     if ssh_sock:
         cmd += ["--setenv", "SSH_AUTH_SOCK", ssh_sock]
@@ -431,12 +439,22 @@ def _save_allowlist(doc: tomlkit.TOMLDocument, key: str, targets: list[Path]) ->
 # Overridden by the top-level --trace / --no-trace flags consumed in main().
 _TRACE_OVERRIDE: Optional[bool] = None
 
+# Whether to disable venv for the current invocation.
+# Overridden by the top-level --no-venv flag consumed in main().
+_VENV_DISABLE_OVERRIDE: Optional[bool] = None
+
 
 def _trace_enabled() -> bool:
     if _TRACE_OVERRIDE is not None:
         return _TRACE_OVERRIDE
     val = read_doc().get("trace")
     return False if val is None else bool(val)
+
+
+def _venv_disabled() -> bool:
+    if _VENV_DISABLE_OVERRIDE is not None:
+        return _VENV_DISABLE_OVERRIDE
+    return False
 
 
 def _consume_trace_flags(args: list[str]) -> tuple[list[str], Optional[bool]]:
@@ -452,6 +470,21 @@ def _consume_trace_flags(args: list[str]) -> tuple[list[str], Optional[bool]]:
         else:
             break
     return args, override
+
+
+def _consume_venv_flags(args: list[str]) -> tuple[list[str], Optional[bool]]:
+    """Strip leading --no-venv tokens. Returns (rest, override)."""
+    override: Optional[bool] = None
+    while args:
+        if args[0] == "--no-venv":
+            override = True
+            args = args[1:]
+        else:
+            break
+    return args, override
+
+
+
 
 
 def run_under_sandbox(cmd: list[str]) -> int:
@@ -564,7 +597,7 @@ def print_cmd(
     if name not in agents:
         die(f"error: unknown agent '{name}'; known: {', '.join(agents) or '(none)'}")
     cfg = agents[name]
-    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"] + list(ctx.args), state_dir=cfg.get("state_dir"))
+    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"] + list(ctx.args), state_dir=cfg.get("state_dir"), disable_venv=_venv_disabled())
     typer.echo(" \\\n  ".join(shlex.quote(a) for a in cmd))
 
 
@@ -583,7 +616,7 @@ def _register_agents(app: typer.Typer) -> None:
 
         def make_handler(command: str, default_args: list[str], state_dir: Optional[Path]):
             def handler(ctx: typer.Context) -> None:
-                _, cmd = build_bwrap_cmd(command, default_args + list(ctx.args), state_dir=state_dir)
+                _, cmd = build_bwrap_cmd(command, default_args + list(ctx.args), state_dir=state_dir, disable_venv=_venv_disabled())
                 raise typer.Exit(run_under_sandbox(cmd))
             args_help = " ".join(default_args) if default_args else "(none)"
             handler.__doc__ = f"Run `{command}` in the sandbox. Default args: {args_help}."
@@ -605,7 +638,7 @@ def _root(ctx: typer.Context) -> None:
     if name not in agents:
         die(f"error: default_agent '{name}' has no [agents.{name}] table")
     cfg = agents[name]
-    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"], state_dir=cfg.get("state_dir"))
+    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"], state_dir=cfg.get("state_dir"), disable_venv=_venv_disabled())
     raise typer.Exit(run_under_sandbox(cmd))
 
 
@@ -613,15 +646,18 @@ _register_agents(app)
 
 
 def main() -> None:
-    global _TRACE_OVERRIDE
+    global _TRACE_OVERRIDE, _VENV_DISABLE_OVERRIDE
     args, override = _consume_trace_flags(sys.argv[1:])
     if override is not None:
         _TRACE_OVERRIDE = override
+    args, override = _consume_venv_flags(args)
+    if override is not None:
+        _VENV_DISABLE_OVERRIDE = override
     sys.argv = [sys.argv[0]] + args
     if args and not args[0].startswith("-"):
         click_cmd = typer.main.get_command(app)
         if args[0] not in click_cmd.commands:
-            _, cmd = build_bwrap_cmd(args[0], args[1:])
+            _, cmd = build_bwrap_cmd(args[0], args[1:], disable_venv=_venv_disabled())
             sys.exit(run_under_sandbox(cmd))
     app()
 
