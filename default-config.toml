@@ -1,7 +1,8 @@
 # Default botbox config. Copied to ~/.config/botbox/config.toml on first run.
 # Each agents.<name> table becomes a `botbox <name>` subcommand.
 
-default_agent = "claude"
+# Uncomment to set which agent runs on a bare `botbox` invocation.
+# default_agent = "claude"
 
 # Wrap every sandbox invocation in strace so botbox can detect paths the
 # command tried to open but couldn't reach inside the sandbox, and offer to
@@ -14,18 +15,25 @@ default_agent = "claude"
 # [python]
 # venv = "~/repos/venv"
 
+# Env variables to set inside the sandbox (--setenv). These can override the
+# defaults (HOME, PATH, TERM, ...). A value starting with $ reads the matching
+# host variable when the sandbox starts; it's skipped if unset on the host.
+# [env]
+# GITHUB_TOKEN = "$GITHUB_TOKEN"
+# EDITOR = "vim"
+
 [paths]
 # Repos to expose to the sandbox. The current working directory is always
 # bound rw for the invocation, so list things here only when you want them
 # available beyond cwd (e.g. a sibling library edited alongside the main repo).
+# Entries are paths (mounted at the same location) or inline tables with a
+# "dest" to mount a host path somewhere else inside the sandbox, e.g. per-agent
+# Claude Code state:
+#   { source = "~/.local/share/botbox/claude/.claude", dest = "~/.claude" }
 rw = []
 ro = []
 
-[agents.claude]
-command = "claude"
-args = ["--dangerously-skip-permissions"]
-# Sandboxed runs get their own session/login state at
-# ~/.local/share/botbox/claude by default. Set to "host" to share the host's
-# real ~/.claude, or to a custom path. The directory and a stub .claude.json
-# are created on first run; you'll need to log in once inside the sandbox.
-# state_dir = "host"
+# Each agents.<name> table becomes a `botbox <name>` subcommand, e.g.:
+# [agents.claude]
+# command = "claude"
+# args = ["--dangerously-skip-permissions"]

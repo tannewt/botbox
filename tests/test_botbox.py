@@ -34,9 +34,25 @@ def test_load_paths_rw_and_ro(cfg_env):
     write_cfg(cfg_env, '[paths]\nrw = ["/a", "/b"]\nro = ["/c"]\n')
     entries = botbox.load_paths(botbox.read_doc())
     assert entries == [
-        (Path("/a"), False),
-        (Path("/b"), False),
-        (Path("/c"), True),
+        (Path("/a"), False, None),
+        (Path("/b"), False, None),
+        (Path("/c"), True, None),
+    ]
+
+
+def test_load_paths_dest_tables(cfg_env, monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    write_cfg(cfg_env, '''[paths]
+rw = ["/a", { source = "/state/.claude", dest = "~/.claude" }]
+ro = [{ source = "/state/data", dest = "/data" }]
+''')
+    entries = botbox.load_paths(botbox.read_doc())
+    assert entries == [
+        (Path("/a"), False, None),
+        (Path("/state/.claude"), False, fake_home / ".claude"),
+        (Path("/state/data"), True, Path("/data")),
     ]
 
 
@@ -46,7 +62,7 @@ def test_load_paths_expands_tilde(cfg_env, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(fake_home))
     write_cfg(cfg_env, '[paths]\nrw = ["~/repo"]\n')
     entries = botbox.load_paths(botbox.read_doc())
-    assert entries[0] == (fake_home / "repo", False)
+    assert entries[0] == (fake_home / "repo", False, None)
 
 
 def test_load_venv(cfg_env):
@@ -54,40 +70,53 @@ def test_load_venv(cfg_env):
     assert botbox.load_venv(botbox.read_doc()) == Path("/v")
 
 
-def test_load_agents_and_default(cfg_env, monkeypatch, tmp_path):
+def test_load_env_and_resolve(cfg_env, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    monkeypatch.setenv("HOME", "/home/u")
+    monkeypatch.delenv("MISSING_VAR", raising=False)
+    write_cfg(cfg_env, '''
+[env]
+GITHUB_TOKEN = "$GITHUB_TOKEN"
+EDITOR = "vim"
+HOME = "${HOME}/sub"
+MISSING = "$MISSING_VAR"
+TILDE = "~/thing"
+''')
+    env = botbox.load_env(botbox.read_doc())
+    assert env == {
+        "GITHUB_TOKEN": "$GITHUB_TOKEN",
+        "EDITOR": "vim",
+        "HOME": "${HOME}/sub",
+        "MISSING": "$MISSING_VAR",
+        "TILDE": "~/thing",
+    }
+    resolved = botbox.resolve_env(env)
+    assert resolved == {"GITHUB_TOKEN": "gh-secret", "EDITOR": "vim",
+                        "HOME": "/home/u/sub", "TILDE": "/home/u/thing"}
+    # Missing host var is dropped (a warning is printed on stderr).
+    assert "MISSING" not in resolved
+
+
+def test_load_agents(cfg_env, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     write_cfg(cfg_env, """
-default_agent = "claude"
-
 [agents.claude]
 command = "claude"
 args = ["--foo", "--bar"]
-state_dir = "/var/sandbox/claude"
 
 [agents.codex]
 command = "/usr/bin/codex"
-
-[agents.shared]
-command = "shared"
-state_dir = "host"
 """)
     doc = botbox.read_doc()
-    assert botbox.default_agent(doc) == "claude"
     agents = botbox.load_agents(doc)
-    # explicit path is respected
     assert agents["claude"] == {
         "command": "claude",
         "args": ["--foo", "--bar"],
-        "state_dir": Path("/var/sandbox/claude"),
     }
-    # unset -> auto sandbox dir under ~/.local/share/botbox/<name>
     assert agents["codex"] == {
         "command": "/usr/bin/codex",
         "args": [],
-        "state_dir": tmp_path / ".local" / "share" / "botbox" / "codex",
     }
-    # "host" sentinel -> None (binds host's real ~/.claude)
-    assert agents["shared"]["state_dir"] is None
 
 
 def test_cli_list_empty(cfg_env):
@@ -104,7 +133,7 @@ def test_cli_add_rw(cfg_env, tmp_path):
     result = runner.invoke(botbox.app, ["add", str(target)])
     assert result.exit_code == 0
     entries = botbox.load_paths(botbox.read_doc())
-    assert (target.resolve(), False) in entries
+    assert (target.resolve(), False, None) in entries
 
 
 def test_cli_add_ro(cfg_env, tmp_path):
@@ -114,7 +143,7 @@ def test_cli_add_ro(cfg_env, tmp_path):
     result = runner.invoke(botbox.app, ["add", "--ro", str(target)])
     assert result.exit_code == 0
     entries = botbox.load_paths(botbox.read_doc())
-    assert (target.resolve(), True) in entries
+    assert (target.resolve(), True, None) in entries
 
 
 def test_cli_add_multiple_paths(cfg_env, tmp_path):
@@ -126,8 +155,8 @@ def test_cli_add_multiple_paths(cfg_env, tmp_path):
     result = runner.invoke(botbox.app, ["add", str(a), str(b)])
     assert result.exit_code == 0
     entries = botbox.load_paths(botbox.read_doc())
-    assert (a.resolve(), False) in entries
-    assert (b.resolve(), False) in entries
+    assert (a.resolve(), False, None) in entries
+    assert (b.resolve(), False, None) in entries
 
 
 def test_cli_add_multiple_paths_partial_dedup(cfg_env, tmp_path):
@@ -142,8 +171,8 @@ def test_cli_add_multiple_paths_partial_dedup(cfg_env, tmp_path):
     assert "already present" in result.stdout
     assert f"added paths.rw: {b.resolve()}" in result.stdout
     entries = botbox.load_paths(botbox.read_doc())
-    assert sum(1 for p, _ in entries if p == a.resolve()) == 1
-    assert (b.resolve(), False) in entries
+    assert sum(1 for p, _, _ in entries if p == a.resolve()) == 1
+    assert (b.resolve(), False, None) in entries
 
 
 def test_cli_add_idempotent(cfg_env, tmp_path):
@@ -155,7 +184,128 @@ def test_cli_add_idempotent(cfg_env, tmp_path):
     assert result.exit_code == 0
     assert "already present" in result.stdout
     entries = botbox.load_paths(botbox.read_doc())
-    assert sum(1 for p, _ in entries if p == target.resolve()) == 1
+    assert sum(1 for p, _, _ in entries if p == target.resolve()) == 1
+
+
+def test_cli_add_dest(cfg_env, tmp_path, monkeypatch):
+    runner = CliRunner()
+    source = tmp_path / "state" / ".claude"
+    source.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    result = runner.invoke(botbox.app, ["add", str(source), "--dest", "~/.claude"])
+    assert result.exit_code == 0
+    assert f"added paths.rw: {source.resolve()}" in result.stdout
+    entries = botbox.load_paths(botbox.read_doc())
+    assert (source.resolve(), False, (tmp_path / "home" / ".claude").resolve()) in entries
+    # Config stores an inline table with source/dest.
+    cfg_text = botbox.CONFIG_FILE.read_text()
+    assert "source" in cfg_text and "dest" in cfg_text
+
+
+def test_cli_add_dest_with_multiple_paths_fails(cfg_env, tmp_path):
+    runner = CliRunner()
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    result = runner.invoke(botbox.app, ["add", str(a), str(b), "--dest", "/x"])
+    assert result.exit_code == 1
+    assert "--dest" in (result.stderr or "")
+    # Nothing was written.
+    assert botbox.load_paths(botbox.read_doc()) == []
+
+
+def test_cli_rm_removes_from_rw_and_ro(cfg_env, tmp_path):
+    runner = CliRunner()
+    write_cfg(cfg_env, '[paths]\nrw = ["/a"]\nro = ["/b", "/c"]\n')
+    result = runner.invoke(botbox.app, ["rm", "/a", "/b"])
+    assert result.exit_code == 0
+    assert "removed paths.rw: /a" in result.stdout
+    assert "removed paths.ro: /b" in result.stdout
+    entries = botbox.load_paths(botbox.read_doc())
+    assert entries == [(Path("/c"), True, None)]
+    assert "not in allowlist" not in result.stdout
+
+
+def test_cli_rm_reports_unknown_path(cfg_env, tmp_path):
+    runner = CliRunner()
+    write_cfg(cfg_env, '[paths]\nrw = ["/a"]\n')
+    result = runner.invoke(botbox.app, ["rm", "/zzz"])
+    assert result.exit_code == 0
+    assert "not in allowlist: /zzz" in result.stdout
+    entries = botbox.load_paths(botbox.read_doc())
+    assert entries == [(Path("/a"), False, None)]
+
+
+def test_cli_rm_removes_dest_tables(cfg_env, tmp_path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    write_cfg(cfg_env, '[paths]\nrw = [{ source = "/state/.claude", dest = "~/.claude" }]\n')
+    result = runner.invoke(botbox.app, ["rm", "/state/.claude"])
+    assert result.exit_code == 0
+    assert "removed paths.rw: /state/.claude" in result.stdout
+    assert botbox.load_paths(botbox.read_doc()) == []
+
+
+def test_cli_rm_required_args(cfg_env, tmp_path):
+    runner = CliRunner()
+    result = runner.invoke(botbox.app, ["rm"])
+    assert result.exit_code == 1
+    result = runner.invoke(botbox.app, ["rm", "--missing", "/a"])
+    assert result.exit_code == 1
+    assert "error" in (result.stderr or "")
+
+
+def test_cli_rm_missing_prunes_stale_entries(cfg_env, tmp_path):
+    runner = CliRunner()
+    exists = tmp_path / "exists"
+    exists.mkdir()
+    write_cfg(cfg_env, f'[paths]\nrw = ["{exists}"]\nro = ["/opt/claude-code", "/gone"]\n')
+    result = runner.invoke(botbox.app, ["rm", "--missing"])
+    assert result.exit_code == 0
+    assert "removed paths.ro: /opt/claude-code" in result.stdout
+    assert f"removed paths.rw: {exists}" not in result.stdout
+    entries = botbox.load_paths(botbox.read_doc())
+    assert entries == [(exists, False, None)]
+
+
+def test_cli_rm_missing_nothing_to_do(cfg_env, tmp_path):
+    runner = CliRunner()
+    exists = tmp_path / "exists"
+    exists.mkdir()
+    write_cfg(cfg_env, f'[paths]\nrw = ["{exists}"]\n')
+    result = runner.invoke(botbox.app, ["rm", "--missing"])
+    assert result.exit_code == 0
+    assert "no missing entries" in result.stdout
+    # Config untouched (still parseable, entry intact).
+    assert botbox.load_paths(botbox.read_doc()) == [(exists, False, None)]
+
+
+def test_cli_remove_alias(cfg_env, tmp_path):
+    runner = CliRunner()
+    write_cfg(cfg_env, '[paths]\nrw = ["/a"]\n')
+    result = runner.invoke(botbox.app, ["remove", "/a"])
+    assert result.exit_code == 0
+    assert "removed paths.rw: /a" in result.stdout
+    assert botbox.load_paths(botbox.read_doc()) == []
+
+
+def test_build_bwrap_cmd_dest_binds_to_alternate_location(cfg_env, tmp_path, monkeypatch):
+    repo = tmp_path / "work"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    state = tmp_path / "state" / ".claude"
+    state.mkdir(parents=True)
+    write_cfg(cfg_env, '[paths]\nrw = [{ source = "%s", dest = "%s" }]\n' % (state, fake_home / ".claude"))
+
+    _, cmd = botbox.build_bwrap_cmd("/bin/ls", [])
+    pairs = list(zip(cmd, cmd[1:], cmd[2:]))
+    assert ("--bind", str(state), str(fake_home / ".claude")) in pairs
+    # The host location is NOT bound at its own path.
+    assert ("--bind", str(state), str(state)) not in pairs
 
 
 def test_cli_venv_set_and_show(cfg_env, tmp_path):
@@ -213,46 +363,77 @@ def test_build_bwrap_cmd_binds_venv(cfg_env, tmp_path, monkeypatch):
     assert "VIRTUAL_ENV" in cmd
 
 
-def test_build_bwrap_cmd_state_dir_overlays_claude_home(cfg_env, tmp_path, monkeypatch):
+def test_cli_env_set_list_unset(cfg_env):
+    runner = CliRunner()
+    r0 = runner.invoke(botbox.app, ["env"])
+    assert r0.exit_code == 0
+    assert "no env set" in r0.stdout
+
+    r1 = runner.invoke(botbox.app, ["env-set", "EDITOR", "vim"])
+    assert r1.exit_code == 0
+    assert "set env.EDITOR=vim" in r1.stdout
+    # Re-setting the same key updates rather than duplicating.
+    r2 = runner.invoke(botbox.app, ["env-set", "EDITOR", "nano"])
+    assert r2.exit_code == 0
+    assert "updated env.EDITOR=nano" in r2.stdout
+
+    r3 = runner.invoke(botbox.app, ["env"])
+    assert r3.exit_code == 0
+    assert "EDITOR=nano" in r3.stdout
+
+    # `list` includes the env section too.
+    r4 = runner.invoke(botbox.app, ["list"])
+    assert "env:" in r4.stdout
+    assert "EDITOR=nano" in r4.stdout
+
+    r5 = runner.invoke(botbox.app, ["env-unset", "EDITOR"])
+    assert r5.exit_code == 0
+    assert "unset env.EDITOR" in r5.stdout
+    assert "EDITOR" not in botbox.load_env(botbox.read_doc())
+    r6 = runner.invoke(botbox.app, ["env-unset", "EDITOR"])
+    assert r6.exit_code == 0
+    assert "not set" in r6.stdout
+
+
+def test_cli_env_set_warns_on_missing_host_var(cfg_env, monkeypatch):
+    monkeypatch.delenv("NOPE_VAR", raising=False)
+    runner = CliRunner()
+    result = runner.invoke(botbox.app, ["env-set", "NOPE", "$NOPE_VAR"])
+    assert result.exit_code == 0
+    assert "not currently set on the host" in result.stderr
+
+
+def test_build_bwrap_cmd_sets_env_vars(cfg_env, tmp_path, monkeypatch):
     repo = tmp_path / "work"
     repo.mkdir()
     monkeypatch.chdir(repo)
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
-    monkeypatch.setenv("HOME", str(fake_home))
-    write_cfg(cfg_env, '[paths]\nrw = []\n')
-
-    state = tmp_path / "sandbox-state"
-    _, cmd = botbox.build_bwrap_cmd("/bin/ls", [], state_dir=state)
-
-    sc = state / ".claude"
-    sj = state / ".claude.json"
-    assert sc.is_dir()
-    assert sj.is_file()
-    assert sj.read_text() == "{}\n"
-
-    # The bind maps the state_dir paths onto the sandbox's ~/.claude locations.
-    pairs = list(zip(cmd, cmd[1:], cmd[2:]))
-    assert ("--bind", str(sc), str(fake_home / ".claude")) in pairs
-    assert ("--bind", str(sj), str(fake_home / ".claude.json")) in pairs
-    # And the host's real ~/.claude is NOT bound.
-    assert str(fake_home / ".claude") not in [c for c, n in zip(cmd, cmd[1:]) if c == n]
-
-
-def test_build_bwrap_cmd_without_state_dir_binds_host_claude(cfg_env, tmp_path, monkeypatch):
-    repo = tmp_path / "work"
-    repo.mkdir()
-    monkeypatch.chdir(repo)
-    fake_home = tmp_path / "home"
-    (fake_home / ".claude").mkdir(parents=True)
-    (fake_home / ".claude.json").write_text("{}")
-    monkeypatch.setenv("HOME", str(fake_home))
-    write_cfg(cfg_env, '[paths]\nrw = []\n')
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-secret")
+    write_cfg(cfg_env, '[env]\nGITHUB_TOKEN = "$GITHUB_TOKEN"\nEDITOR = "vim"\n[paths]\nrw = []\n')
 
     _, cmd = botbox.build_bwrap_cmd("/bin/ls", [])
+
     pairs = list(zip(cmd, cmd[1:], cmd[2:]))
-    assert ("--bind", str(fake_home / ".claude"), str(fake_home / ".claude")) in pairs
-    assert ("--bind", str(fake_home / ".claude.json"), str(fake_home / ".claude.json")) in pairs
+    assert ("--setenv", "GITHUB_TOKEN", "gh-secret") in pairs
+    assert ("--setenv", "EDITOR", "vim") in pairs
+    # Configured env comes after the built-ins so it can override them.
+    last_builtin = max(i for i, a in enumerate(cmd) if a in ("HOME", "PATH", "TERM", "LANG"))
+    first_custom = next(i for i, a in enumerate(cmd) if a == "GITHUB_TOKEN")
+    last_builtin = max(i for i, a in enumerate(cmd) if a in ("HOME", "PATH", "TERM", "LANG"))
+    assert first_custom > last_builtin
+
+
+def test_build_bwrap_cmd_env_overrides_builtin(cfg_env, tmp_path, monkeypatch):
+    repo = tmp_path / "work"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    write_cfg(cfg_env, '[env]\nLANG = "de_DE.UTF-8"\n[paths]\nrw = []\n')
+
+    _, cmd = botbox.build_bwrap_cmd("/bin/ls", [])
+
+    # Only one --setenv LANG: the configured value overrides the built-in.
+    langs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--setenv" and cmd[i + 1] == "LANG"]
+    assert langs == ["LANG"]
+    assert cmd[cmd.index("LANG") + 1] == "de_DE.UTF-8"
 
 
 def test_build_bwrap_cmd_dev_path_uses_dev_bind(cfg_env, tmp_path, monkeypatch):
@@ -331,7 +512,8 @@ def test_is_default_covered_system_and_etc(tmp_path):
 
 def test_is_default_covered_home_and_extras():
     home = Path("/home/someone")
-    assert botbox._is_default_covered(home / ".claude" / "session.json", home, None, [])
+    # Agent state dirs like ~/.claude are no longer special-cased.
+    assert not botbox._is_default_covered(home / ".claude" / "session.json", home, None, [])
     assert botbox._is_default_covered(home / ".gitconfig", home, None, [])
     assert not botbox._is_default_covered(home / ".cache" / "thing", home, None, [])
     repo = Path("/srv/myrepo")
@@ -432,8 +614,8 @@ def test_run_under_sandbox_offers_autofix_on_failure(cfg_env, tmp_path, monkeypa
     assert rc == 1
     entries = botbox.load_paths(botbox.read_doc())
     # [a]dd all adds each failed path as-is (no rollup).
-    assert (bin_path, True) in entries
-    assert (pkg, True) not in entries
+    assert (bin_path, True, None) in entries
+    assert (pkg, True, None) not in entries
 
 
 def test_run_under_sandbox_offers_autofix_on_success(cfg_env, tmp_path, monkeypatch):
@@ -465,7 +647,7 @@ def test_run_under_sandbox_offers_autofix_on_success(cfg_env, tmp_path, monkeypa
     assert rc == 0
     # Even though the command succeeded, the prompt fired and the path was added.
     entries = botbox.load_paths(botbox.read_doc())
-    assert (bin_path, True) in entries
+    assert (bin_path, True, None) in entries
 
 
 def test_main_passes_unknown_command_to_bwrap(cfg_env, tmp_path, monkeypatch):

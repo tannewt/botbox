@@ -18,6 +18,11 @@ Pass `--no-venv` (before the subcommand) to skip binding and setting PATH/VIRTUA
 for the configured Python venv for this invocation. Useful for running commands that
 shouldn't see the venv.
 
+Env variables for the sandbox live in the [env] table of the config and are
+managed with `botbox env` (list), `botbox env-set KEY value` and
+`botbox env-unset KEY`. A value starting with `$` (e.g. "$GITHUB_TOKEN") is
+read from the host environment when the sandbox starts.
+
 See the README at https://github.com/... or the source for a full config example.
 """
 
@@ -87,14 +92,25 @@ def write_doc(doc: tomlkit.TOMLDocument) -> None:
     CONFIG_FILE.write_text(tomlkit.dumps(doc))
 
 
-def load_paths(doc) -> list[tuple[Path, bool]]:
+def load_paths(doc) -> list[tuple[Path, bool, Optional[Path]]]:
+    """Return (source, read_only, dest) triples. Entries are strings (mounted
+    at the same path) or inline tables { source = "...", dest = "..." } (mounted
+    at a different path inside the sandbox)."""
     paths = doc.get("paths") or {}
-    out: list[tuple[Path, bool]] = []
+    out: list[tuple[Path, bool, Optional[Path]]] = []
     for p in paths.get("rw") or []:
-        out.append((expand(str(p)), False))
+        out.append(_parse_path_entry(p, False))
     for p in paths.get("ro") or []:
-        out.append((expand(str(p)), True))
+        out.append(_parse_path_entry(p, True))
     return out
+
+
+def _parse_path_entry(p, ro: bool) -> tuple[Path, bool, Optional[Path]]:
+    if isinstance(p, dict):
+        src = expand(str(p["source"]))
+        dest = expand(str(p["dest"])) if p.get("dest") else None
+        return src, ro, dest
+    return expand(str(p)), ro, None
 
 
 def load_venv(doc) -> Optional[Path]:
@@ -102,24 +118,52 @@ def load_venv(doc) -> Optional[Path]:
     return expand(str(v)) if v else None
 
 
+def load_env(doc) -> dict[str, str]:
+    """Parse the [env] table: KEY = "value" pairs to set inside the sandbox.
+    A value starting with `$` (e.g. "$GITHUB_TOKEN" or "${VSCODE_GIT_ASKPASS}")
+    is read from the host environment at launch time."""
+    env = doc.get("env") or {}
+    return {str(k): str(v) for k, v in env.items()}
+
+
+# $NAME or ${NAME} at the start of an env value references a host variable.
+_HOST_VAR_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}(.*)$|^\$([A-Za-z_][A-Za-z0-9_]*)(.*)$")
+
+
+def resolve_env(env: dict[str, str]) -> dict[str, str]:
+    """Expand $VAR / ${VAR} references from the host environment and '~' in
+    values. Missing host vars are warned about and dropped."""
+    out: dict[str, str] = {}
+    for k, v in env.items():
+        m = _HOST_VAR_RE.match(v)
+        if m:
+            name, rest = (m.group(1), m.group(2)) if m.group(1) is not None else (m.group(3), m.group(4))
+            host = os.environ.get(name)
+            if host is None:
+                typer.echo(f"warning: env {k}={v}: '{name}' not set on host; skipping", err=True)
+                continue
+            out[k] = host + rest
+        elif v.startswith("~"):
+            out[k] = os.path.expanduser(v)
+        else:
+            out[k] = v
+    return out
+
+
+def redact_env_value(v: str) -> str:
+    """Redact an env value for display: first 8 characters plus total length,
+    so secrets are not printed."""
+    return f"{v[:8]}… (length {len(v)})"
+
+
 def load_agents(doc) -> dict[str, dict]:
-    """Parse agent tables. Defaults state_dir to a per-agent sandboxed path
-    so the sandboxed agent gets its own ~/.claude; set state_dir = "host" in
-    config to bind the host's real ~/.claude instead."""
+    """Parse agent tables into {name: {command, args}}."""
     agents = doc.get("agents") or {}
     out: dict[str, dict] = {}
     for name, cfg in agents.items():
-        raw = cfg.get("state_dir")
-        if raw is None:
-            state_dir: Optional[Path] = expand(f"~/.local/share/botbox/{name}")
-        elif str(raw) == "host":
-            state_dir = None
-        else:
-            state_dir = expand(str(raw))
         out[str(name)] = {
             "command": str(cfg.get("command", name)),
             "args": [str(a) for a in (cfg.get("args") or [])],
-            "state_dir": state_dir,
         }
     return out
 
@@ -134,26 +178,13 @@ def die(msg: str) -> None:
     raise typer.Exit(1)
 
 
-def _prepare_state_dir(state_dir: Path) -> tuple[Path, Path]:
-    """Ensure <state_dir>/.claude and <state_dir>/.claude.json exist so bwrap can bind them."""
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_claude = state_dir / ".claude"
-    state_json = state_dir / ".claude.json"
-    state_claude.mkdir(exist_ok=True)
-    if not state_json.exists():
-        state_json.write_text("{}\n")
-    return state_claude, state_json
-
-
 def build_bwrap_cmd(
     agent_command: str,
     agent_args: list[str],
-    state_dir: Optional[Path] = None,
     disable_venv: bool = False,
 ) -> tuple[str, list[str]]:
     home = Path.home()
     user = os.environ.get("USER", "")
-    ssh_sock = os.environ.get("SSH_AUTH_SOCK", "")
     pwd = Path.cwd().resolve()
 
     doc = read_doc()
@@ -162,9 +193,9 @@ def build_bwrap_cmd(
 
     # cwd is always bound rw for the current invocation. If it's not already
     # covered by a configured rw path, add an ephemeral entry (not persisted).
-    rw_paths = [p for p, ro in entries if not ro]
+    rw_paths = [p for p, ro, _ in entries if not ro]
     if not any(pwd == p or p in pwd.parents for p in rw_paths):
-        entries.append((pwd, False))
+        entries.append((pwd, False, None))
 
     bwrap = shutil.which("bwrap") or die("error: bwrap not found; install bubblewrap")
     agent_bin = shutil.which(agent_command) or die(f"error: '{agent_command}' not found on PATH")
@@ -192,9 +223,6 @@ def build_bwrap_cmd(
     known_hosts = home / ".ssh" / "known_hosts"
     if known_hosts.exists():
         cmd += ["--ro-bind", str(known_hosts), str(known_hosts)]
-    if ssh_sock:
-        sock_dir = str(Path(ssh_sock).parent)
-        cmd += ["--bind", sock_dir, sock_dir]
 
     # if (home / ".nvm").is_dir():
     #     cmd += ["--ro-bind", str(home / ".nvm"), str(home / ".nvm")]
@@ -204,15 +232,6 @@ def build_bwrap_cmd(
 
     # if (home / ".npm").is_dir():
     #     cmd += ["--bind", str(home / ".npm"), str(home / ".npm")]
-
-    if state_dir is not None:
-        sc, sj = _prepare_state_dir(state_dir)
-        cmd += ["--bind", str(sc), str(home / ".claude")]
-        cmd += ["--bind", str(sj), str(home / ".claude.json")]
-    else:
-        for p in (home / ".claude", home / ".claude.json"):
-            if p.exists():
-                cmd += ["--bind", str(p), str(p)]
 
     if venv and not disable_venv:
         if not venv.exists():
@@ -224,7 +243,7 @@ def build_bwrap_cmd(
     # otherwise the tmpfs overlay would mask binds we just set up.
     cmd += ["--dev", "/dev"]
 
-    for p, ro in entries:
+    for p, ro, dest in entries:
         if not p.exists():
             typer.echo(f"warning: {p} missing; skipping", err=True)
             continue
@@ -233,7 +252,7 @@ def build_bwrap_cmd(
             flag = "--dev-bind"
         else:
             flag = "--ro-bind" if ro else "--bind"
-        cmd += [flag, s, s]
+        cmd += [flag, s, str(dest) if dest is not None else s]
 
     path_env = os.environ.get("PATH", "/usr/bin:/bin")
     if not disable_venv and venv and venv.exists():
@@ -242,22 +261,27 @@ def build_bwrap_cmd(
     cmd += [
         "--tmpfs", "/tmp",
         "--proc", "/proc",
-        "--setenv", "HOME", str(home),
-        "--setenv", "USER", user,
-        "--setenv", "PATH", path_env,
-        "--setenv", "TERM", os.environ.get("TERM", "xterm-256color"),
-        "--setenv", "LANG", os.environ.get("LANG", "C.UTF-8"),
-    ]
-    if not disable_venv and venv and venv.exists():
-        cmd += ["--setenv", "VIRTUAL_ENV", str(venv)]
-    if ssh_sock:
-        cmd += ["--setenv", "SSH_AUTH_SOCK", ssh_sock]
-
-    cmd += [
         "--share-net",
         "--unshare-pid",
         "--die-with-parent",
         "--chdir", str(pwd),
+    ]
+
+    # Built-in env first; configured [env] vars override them (and can add more).
+    sandbox_env = {
+        "HOME": str(home),
+        "USER": user,
+        "PATH": path_env,
+        "TERM": os.environ.get("TERM", "xterm-256color"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    if not disable_venv and venv and venv.exists():
+        sandbox_env["VIRTUAL_ENV"] = str(venv)
+    sandbox_env.update(resolve_env(load_env(doc)))
+    for k, v in sandbox_env.items():
+        cmd += ["--setenv", k, v]
+
+    cmd += [
         agent_bin,
     ] + agent_args
 
@@ -272,23 +296,27 @@ def list_cmd() -> None:
     entries = load_paths(doc)
     agents = load_agents(doc)
     default = default_agent(doc)
+    env = load_env(doc)
 
+    if env:
+        typer.echo("env:")
+        for k, v in env.items():
+            typer.echo(f"  {k}={redact_env_value(v)}")
     if venv:
         missing = "  [MISSING]" if not venv.exists() else ""
         typer.echo(f"venv  {venv}{missing}")
-    for p, ro in entries:
+    for p, ro, dest in entries:
         marker = "ro " if ro else "rw "
         missing = "  [MISSING]" if not p.exists() else ""
-        typer.echo(f"{marker}  {p}{missing}")
+        dest_str = f" -> {dest}" if dest is not None else ""
+        typer.echo(f"{marker}  {p}{dest_str}{missing}")
     if agents:
         typer.echo("agents:")
         for name, cfg in agents.items():
             mark = " (default)" if name == default else ""
             argstr = " " + " ".join(shlex.quote(a) for a in cfg["args"]) if cfg["args"] else ""
             typer.echo(f"  {name}{mark}: {cfg['command']}{argstr}")
-            if cfg.get("state_dir"):
-                typer.echo(f"    state_dir: {cfg['state_dir']}")
-    if not venv and not entries and not agents:
+    if not env and not venv and not entries and not agents:
         typer.echo(f"(empty; edit {CONFIG_FILE} or run: botbox add)")
 
 
@@ -296,9 +324,14 @@ def list_cmd() -> None:
 def add(
     paths: Optional[list[Path]] = typer.Argument(None, help="Paths to add (default: cwd)."),
     ro: bool = typer.Option(False, "--ro", help="Bind read-only."),
+    dest: Optional[Path] = typer.Option(
+        None, "--dest", help="Mount point inside the sandbox (default: same path). Single path only."
+    ),
 ) -> None:
     """Add one or more paths to the allowlist."""
     targets = [p.resolve() for p in paths] if paths else [Path.cwd().resolve()]
+    if dest is not None and len(targets) > 1:
+        die("error: --dest can only be used with a single path")
     doc = read_doc()
     if "paths" not in doc:
         doc["paths"] = tomlkit.table()
@@ -306,18 +339,88 @@ def add(
     if key not in doc["paths"]:
         doc["paths"][key] = tomlkit.array()
     arr = doc["paths"][key]
-    existing = {expand(str(x)) for x in arr}
+    existing = {
+        expand(str(x["source"])) if isinstance(x, dict) else expand(str(x)) for x in arr
+    }
     changed = False
     for p in targets:
         if p in existing:
             typer.echo(f"already present in paths.{key}: {p}")
             continue
-        arr.append(str(p))
+        if dest is not None:
+            row = tomlkit.inline_table()
+            row["source"] = str(p)
+            row["dest"] = str(dest.expanduser().resolve())
+            arr.append(row)
+        else:
+            arr.append(str(p))
         existing.add(p)
         changed = True
-        typer.echo(f"added paths.{key}: {p}")
+        typer.echo(f"added paths.{key}: {p}" + (f" -> {dest}" if dest is not None else ""))
     if changed:
         write_doc(doc)
+
+
+@app.command("rm")
+def rm(
+    paths: Optional[list[Path]] = typer.Argument(
+        None, help="Paths to remove from the allowlist (both paths.rw and paths.ro)."
+    ),
+    missing: bool = typer.Option(
+        False, "--missing", help="Remove every allowlist entry that no longer exists on the host."
+    ),
+) -> None:
+    """Remove paths from the allowlist."""
+    if missing and paths:
+        die("error: --missing cannot be combined with paths")
+    if not missing and not paths:
+        die("error: give a path to remove (or use --missing to prune stale entries)")
+    doc = read_doc()
+    doc_paths = doc.get("paths")
+    if doc_paths is None:
+        typer.echo("(allowlist is empty)")
+        return
+    wanted: set[Path] = set()
+    for p in paths or []:
+        wanted.add(expand(str(p)))
+
+    def _drop(entry) -> bool:
+        src = _parse_path_entry(entry, False)[0]
+        if missing:
+            return not Path(src).exists()
+        return src in wanted or Path(src).resolve() in wanted
+
+    not_found = set(wanted)
+    changed = False
+    for key in ("rw", "ro"):
+        arr = doc_paths.get(key)
+        if arr is None:
+            continue
+        kept = []
+        for entry in arr:
+            if _drop(entry):
+                src = _parse_path_entry(entry, False)[0]
+                not_found.discard(Path(src))
+                not_found.discard(Path(src).resolve())
+                typer.echo(f"removed paths.{key}: {src}")
+                changed = True
+            else:
+                kept.append(entry)
+        if changed and len(kept) != len(list(arr)):
+            new_arr = tomlkit.array()
+            for entry in kept:
+                new_arr.append(entry)
+            doc_paths[key] = new_arr
+    if missing and not changed:
+        typer.echo("no missing entries")
+        return
+    for p in sorted(not_found, key=str):
+        typer.echo(f"not in allowlist: {p}")
+    if changed:
+        write_doc(doc)
+
+
+app.command("remove")(rm)
 
 
 # Patterns for syscalls where the path is the second argument (after a fd/AT_FDCWD)
@@ -362,7 +465,6 @@ def _is_default_covered(p: Path, home: Path, venv: Optional[Path], extras: list[
         if s == f or s.startswith(f + "/"):
             return True
     covered_home = (
-        home / ".claude", home / ".claude.json",
         home / ".gitconfig", home / ".config" / "git",
         home / ".ssh" / "known_hosts",
         home / ".local",
@@ -526,7 +628,8 @@ def _offer_autofix(trace_file: Path) -> None:
     doc = read_doc()
     home = Path.home()
     venv = load_venv(doc)
-    extras = [p for p, _ in load_paths(doc)]
+    loaded = load_paths(doc)
+    extras = [p for p, _, _ in loaded] + [d for _, _, d in loaded if d is not None]
     candidates = sorted(
         (p for p in paths
          if not _is_default_covered(p, home, venv, extras) and p.exists()),
@@ -583,6 +686,51 @@ def venv(path: Optional[Path] = typer.Argument(None, help="Venv to use (omit to 
     typer.echo(f"venv set: {p}")
 
 
+@app.command("env")
+def env_cmd() -> None:
+    """List env variables set inside the sandbox (values are redacted)."""
+    env = load_env(read_doc())
+    if not env:
+        typer.echo("(no env set; set one with: botbox env-set KEY value)")
+        return
+    for k, v in env.items():
+        typer.echo(f"{k}={redact_env_value(v)}")
+
+
+@app.command("env-set")
+def env_set(
+    key: str = typer.Argument(help="Env variable name."),
+    value: str = typer.Argument(help="Value. Starting with $ reads the host env var at launch."),
+) -> None:
+    """Set (or overwrite) an env variable for the sandbox ([env] table)."""
+    doc = read_doc()
+    if "env" not in doc:
+        doc["env"] = tomlkit.table()
+    existed = key in doc["env"]
+    doc["env"][key] = value
+    write_doc(doc)
+    verb = "updated" if existed else "set"
+    typer.echo(f"{verb} env.{key}={value}")
+    if value.startswith("$"):
+        m = _HOST_VAR_RE.match(value)
+        name = m.group(1) if m and m.group(1) is not None else (m.group(3) if m else None)
+        if name and name not in os.environ:
+            typer.echo(f"warning: '{name}' is not currently set on the host; it will be skipped", err=True)
+
+
+@app.command("env-unset")
+def env_unset(key: str = typer.Argument(help="Env variable name.")) -> None:
+    """Remove an env variable from the sandbox config."""
+    doc = read_doc()
+    env = doc.get("env")
+    if not env or key not in env:
+        typer.echo(f"not set: env.{key}")
+        return
+    del env[key]
+    write_doc(doc)
+    typer.echo(f"unset env.{key}")
+
+
 @app.command("print", context_settings=PASSTHROUGH)
 def print_cmd(
     ctx: typer.Context,
@@ -597,7 +745,7 @@ def print_cmd(
     if name not in agents:
         die(f"error: unknown agent '{name}'; known: {', '.join(agents) or '(none)'}")
     cfg = agents[name]
-    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"] + list(ctx.args), state_dir=cfg.get("state_dir"), disable_venv=_venv_disabled())
+    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"] + list(ctx.args), disable_venv=_venv_disabled())
     typer.echo(" \\\n  ".join(shlex.quote(a) for a in cmd))
 
 
@@ -612,17 +760,15 @@ def _register_agents(app: typer.Typer) -> None:
         command = cfg["command"]
         default_args = cfg["args"]
 
-        state_dir = cfg.get("state_dir")
-
-        def make_handler(command: str, default_args: list[str], state_dir: Optional[Path]):
+        def make_handler(command: str, default_args: list[str]):
             def handler(ctx: typer.Context) -> None:
-                _, cmd = build_bwrap_cmd(command, default_args + list(ctx.args), state_dir=state_dir, disable_venv=_venv_disabled())
+                _, cmd = build_bwrap_cmd(command, default_args + list(ctx.args), disable_venv=_venv_disabled())
                 raise typer.Exit(run_under_sandbox(cmd))
             args_help = " ".join(default_args) if default_args else "(none)"
             handler.__doc__ = f"Run `{command}` in the sandbox. Default args: {args_help}."
             return handler
 
-        app.command(name=name, context_settings=PASSTHROUGH)(make_handler(command, default_args, state_dir))
+        app.command(name=name, context_settings=PASSTHROUGH)(make_handler(command, default_args))
 
 
 @app.callback(invoke_without_command=True)
@@ -638,7 +784,7 @@ def _root(ctx: typer.Context) -> None:
     if name not in agents:
         die(f"error: default_agent '{name}' has no [agents.{name}] table")
     cfg = agents[name]
-    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"], state_dir=cfg.get("state_dir"), disable_venv=_venv_disabled())
+    _, cmd = build_bwrap_cmd(cfg["command"], cfg["args"], disable_venv=_venv_disabled())
     raise typer.Exit(run_under_sandbox(cmd))
 
 

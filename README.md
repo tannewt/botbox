@@ -9,9 +9,9 @@ agent in a sandbox that exposes only:
 
 - the repos you've added to the allowlist,
 - the current working directory (always rw, for this invocation only),
-- your `.claude` login/session state,
 - a configured Python venv (read-only),
-- your git config and the SSH agent socket (no private keys),
+- your git config,
+- env vars from the `[env]` config table,
 - system libraries and the bits of `/etc` needed for DNS and TLS.
 
 The bubblewrap approach is adapted from
@@ -42,6 +42,10 @@ default_agent = "claude"
 [python]
 venv = "~/repos/venv"
 
+[env]
+# EDITOR = "vim"
+# GITHUB_TOKEN = "$GITHUB_TOKEN"   # reads the host's GITHUB_TOKEN at launch
+
 [paths]
 rw = ["~/repos/circuitpython"]
 ro = []
@@ -49,19 +53,27 @@ ro = []
 [agents.claude]
 command = "claude"
 args = ["--dangerously-skip-permissions"]
-# state_dir = "host"   # uncomment to share the host's real ~/.claude
 ```
 
 Each `[agents.<name>]` table becomes a subcommand. `command` is the binary
 to exec; `args` is prepended to anything you pass on the CLI.
 
-`state_dir` controls where the agent's `~/.claude` and `~/.claude.json` come
-from inside the sandbox. By default (unset) it points at
-`~/.local/share/botbox/<agent>` on the host, so sandboxed runs get their
-own session/login state and don't read or modify your host Claude. Set it
-to `"host"` to bind the host's real `~/.claude` instead, or to any path
-for a custom location. The directory and a stub `.claude.json` are created
-on first run; you'll need to log in once inside the sandbox.
+`botbox add PATH --dest DEST` mounts `PATH` at `DEST` inside the sandbox
+instead of at its own location. This is how you give a sandboxed agent its
+own state, e.g. per-agent Claude Code login/session state:
+
+```toml
+[paths]
+rw = [
+  { source = "~/.local/share/botbox/claude/.claude", dest = "~/.claude" },
+  { source = "~/.local/share/botbox/claude/.claude.json", dest = "~/.claude.json" },
+]
+```
+
+The `dest` location must not otherwise exist in the sandbox (it's overlaying
+the real `~/.claude` here, which is not bound by default). Create the source
+dirs and a stub `~/.claude.json` (`echo '{}' > ...`) before the first run;
+you'll need to log in once inside the sandbox.
 
 ## Usage
 
@@ -74,7 +86,13 @@ botbox list             # show config
 botbox add              # add cwd to paths.rw
 botbox add PATH...      # add one or more paths to paths.rw
 botbox add --ro PATH... # add paths read-only
+botbox add PATH --dest DEST # mount PATH at a different sandbox location
 botbox venv ~/repos/v   # set the default Python venv
+botbox env              # list env vars set inside the sandbox
+botbox env-set K V      # set an env var (a $VAR value reads the host var at launch)
+botbox env-unset K      # remove an env var
+botbox rm PATH...       # remove paths from the allowlist (both ro and rw)
+botbox rm --missing     # remove allowlist entries that no longer exist on the host
 botbox print claude     # print the bwrap command instead of executing it
 botbox --trace claude   # wrap in strace and prompt to allowlist missing paths
 ```
@@ -130,14 +148,19 @@ Read-only:
 
 Read-write:
 
-- `~/.claude`, `~/.claude.json` (login + sessions)
 - `~/.npm` (package cache)
-- the SSH agent socket directory (signing only; no private key access)
 - entries under `[paths] rw`
 - the current working directory
 
 Kernel filesystems are namespaced: `/proc` (with a new PID namespace),
 `/dev`, and a fresh `tmpfs` at `/tmp`. Networking is shared with the host.
+
+Env variables from `[env]` are applied with `--setenv` after the built-ins
+(`HOME`, `USER`, `PATH`, `TERM`, `LANG`, `VIRTUAL_ENV`), so
+they can override them. A value starting with `$` (e.g.
+`GITHUB_TOKEN = "$GITHUB_TOKEN"`) is read from the host environment when the
+sandbox starts and skipped with a warning if unset on the host; a leading `~`
+is expanded.
 
 ## License
 
